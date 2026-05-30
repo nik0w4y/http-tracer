@@ -1,5 +1,12 @@
 #include <pcap.h>
+#include <pcap/pcap.h>
 #include <stdio.h>
+#include <sys/types.h>
+
+void callback(u_char *args, const struct pcap_pkthdr *header,
+              const u_char *packet) {
+  printf("packet length: %d\n", header->len);
+}
 
 int main(int argc, char *argv[]) {
   pcap_t *handle;
@@ -13,7 +20,10 @@ int main(int argc, char *argv[]) {
   const u_char *packet;
   pcap_if_t *alldevs;
 
-  pcap_findalldevs(&alldevs, errbuf);
+  if (pcap_findalldevs(&alldevs, errbuf) != 0) {
+    fprintf(stderr, "findalldevs hot verkockt error: %s\n", errbuf);
+    return (2);
+  };
   dev = alldevs->name;
 
   if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
@@ -39,9 +49,7 @@ int main(int argc, char *argv[]) {
     return (2);
   }
 
-  packet = pcap_next(handle, &header);
-
-  printf("Jacked a packet with length of [%d]\n", header.len);
+  pcap_loop(handle, 0, callback, NULL);
 
   pcap_close(handle);
   return (0);
