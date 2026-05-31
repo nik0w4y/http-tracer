@@ -1,3 +1,3 @@
 # http tracer
 
-gcc tracer.c -o tracer -lpcap
+gcc tracer.c -o tracer -lpcap -lz
