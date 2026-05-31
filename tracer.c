@@ -1,11 +1,12 @@
 #include "zlib.h"
 #include <pcap.h>
 #include <pcap/pcap.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <zconf-ng.h>
-
 // structure definitions by tim carstens
 /* Ethernet addresses are 6 bytes */
 #define ETHER_ADDR_LEN 6
@@ -72,6 +73,20 @@ const char *payload;                   /* Packet payload */
 u_int size_ip;
 u_int size_tcp;
 
+struct tcp_stream {
+  uint32_t src_ip;
+  uint16_t src_port;
+  uint32_t dst_ip;
+  uint16_t dst_port;
+  char *buffer;
+  int bufferlen;
+  int contentlen;
+};
+
+#define MAXTCPCONNECTIONS 100
+struct tcp_stream tcpconnections[MAXTCPCONNECTIONS];
+int connections = 0;
+
 void decompress(const char *bodyptr, int bodylength) {
   z_stream streamy;
   streamy.zalloc = Z_NULL;
@@ -91,8 +106,14 @@ void decompress(const char *bodyptr, int bodylength) {
   inflateEnd(&streamy);
 
   char *titlestart = strstr(outbuf, "<title>");
-  titlestart += 7;
   char *titleend = strstr(outbuf, "</title>");
+  if (!titlestart || !titleend) {
+    FILE *f = fopen("unknown.html", "w");
+    fwrite(outbuf, 1, streamy.total_out, f);
+    fclose(f);
+    return;
+  }
+  titlestart += 7;
   int titlelen = titleend - titlestart;
   char title[titlelen + 1];
   strncpy(title, titlestart, titlelen);
@@ -125,16 +146,56 @@ void callback(u_char *args, const struct pcap_pkthdr *header,
   payload = (char *)(packet + SIZE_ETHERNET + size_ip + size_tcp);
   int payload_len = header->len - (SIZE_ETHERNET + size_ip + size_tcp);
 
-  int body_len;
-  const char *body = strstr(payload, "\r\n\r\n");
-  if (body && strstr(payload, "Content-Encoding: gzip")) {
-    body += 4; // skip past the \r\n\r\n
+  const char *body = NULL;
+  int body_len = 0;
+
+  const char *header_end = strstr(payload, "\r\n\r\n");
+  if (header_end && strstr(payload, "Content-Encoding: gzip")) {
+    body = header_end + 4;
     body_len = payload_len - (body - payload);
-    // pass body and body_len to your decompress function
-    decompress(body, body_len);
+  }
+
+  if (!body || body_len <= 0)
+    return;
+  int found = 0;
+  for (int i = 0; i < connections; i++) {
+    if (ip->ip_src.s_addr == tcpconnections[i].src_ip &&
+        ip->ip_dst.s_addr == tcpconnections[i].dst_ip &&
+        tcp->th_sport == tcpconnections[i].src_port &&
+        tcp->th_dport == tcpconnections[i].dst_port) {
+      found = 1;
+      tcpconnections[i].bufferlen += body_len;
+      tcpconnections[i].buffer =
+          realloc(tcpconnections[i].buffer, tcpconnections[i].bufferlen);
+      memcpy(tcpconnections[i].buffer + tcpconnections[i].bufferlen - body_len,
+             body, body_len);
+      if (tcpconnections[i].bufferlen >= tcpconnections[i].contentlen) {
+        decompress(tcpconnections[i].buffer, tcpconnections[i].bufferlen);
+      }
+      break;
+    }
+  }
+
+  if (!found) {
+    // create new connection
+    tcpconnections[connections].src_ip = ip->ip_src.s_addr;
+    tcpconnections[connections].dst_ip = ip->ip_dst.s_addr;
+    tcpconnections[connections].src_port = tcp->th_sport;
+    tcpconnections[connections].dst_port = tcp->th_dport;
+    tcpconnections[connections].bufferlen = body_len;
+    tcpconnections[connections].buffer = malloc(body_len);
+    memcpy(tcpconnections[connections].buffer, body, body_len);
+    const char *contentlenstart = strstr(payload, "Content-Length: ");
+    contentlenstart += 16;
+    tcpconnections[connections].contentlen = atoi(contentlenstart);
+    if (tcpconnections[connections].bufferlen >=
+        tcpconnections[connections].contentlen) {
+      decompress(tcpconnections[connections].buffer,
+                 tcpconnections[connections].bufferlen);
+    }
+    connections++;
   }
 }
-
 int main(int argc, char *argv[]) {
   pcap_t *handle;
   char *dev;
