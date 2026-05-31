@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 #include <sys/types.h>
 #include <zconf-ng.h>
 // structure definitions by tim carstens
@@ -81,82 +82,165 @@ struct tcp_stream {
   char *buffer;
   int bufferlen;
   int contentlen;
+  int is_gzip;
+  int active; /* 0 = connection alive but no current response being assembled */
 };
 
 #define MAXTCPCONNECTIONS 100
 struct tcp_stream tcpconnections[MAXTCPCONNECTIONS];
 int connections = 0;
 
-void decompress(const char *bodyptr, int bodylength) {
-  z_stream streamy;
-  streamy.zalloc = Z_NULL;
-  streamy.zfree = Z_NULL;
-  streamy.opaque = Z_NULL;
+void writetofile(const char *input, int n, const char *src, const char *dst) {
+  const char *titlestart = strstr(input, "<title>");
+  const char *titleend = strstr(input, "</title>");
+  char filename_buf[256];
+  const char *filename;
+  if (!titlestart || !titleend) {
+    filename = "unknown.html";
+  } else {
+    titlestart += 7;
+    while (*titlestart == ' ' || *titlestart == '\t' ||
+           *titlestart == '\r' || *titlestart == '\n')
+      titlestart++;
+    while (titleend > titlestart &&
+           (titleend[-1] == ' ' || titleend[-1] == '\t' ||
+            titleend[-1] == '\r' || titleend[-1] == '\n'))
+      titleend--;
+    int titlelen = titleend - titlestart;
+    if (titlelen <= 0) {
+      filename = "unknown.html";
+    } else {
+      char title[titlelen + 1];
+      strncpy(title, titlestart, titlelen);
+      title[titlelen] = '\0';
+      snprintf(filename_buf, sizeof(filename_buf), "%s.html", title);
+      filename = filename_buf;
+    }
+  }
+  FILE *f = fopen(filename, "w");
+  if (f) { fwrite(input, 1, n, f); fclose(f); }
+  printf("SAVED\t%s\t%s\t%s\n", filename, src, dst);
+  fflush(stdout);
+}
+
+void decompress(const char *bodyptr, int bodylength, const char *src, const char *dst) {
+  z_stream streamy = {0};
   streamy.next_in = (Bytef *)bodyptr;
   streamy.avail_in = bodylength;
-
   inflateInit2(&streamy, 16 + MAX_WBITS);
 
-  char outbuf[65536];
+  char *outbuf = NULL;
+  size_t outlen = 0;
+  int ret;
+  char chunk[65536];
 
-  streamy.next_out = (Bytef *)outbuf;
-  streamy.avail_out = sizeof(outbuf);
+  do {
+    streamy.next_out = (Bytef *)chunk;
+    streamy.avail_out = sizeof(chunk);
+    ret = inflate(&streamy, Z_NO_FLUSH);
+    size_t have = sizeof(chunk) - streamy.avail_out;
+    outbuf = realloc(outbuf, outlen + have);
+    memcpy(outbuf + outlen, chunk, have);
+    outlen += have;
+  } while (ret == Z_OK);
 
-  inflate(&streamy, Z_FINISH);
   inflateEnd(&streamy);
 
-  char *titlestart = strstr(outbuf, "<title>");
-  char *titleend = strstr(outbuf, "</title>");
-  if (!titlestart || !titleend) {
-    FILE *f = fopen("unknown.html", "w");
-    fwrite(outbuf, 1, streamy.total_out, f);
-    fclose(f);
-    return;
-  }
-  titlestart += 7;
-  int titlelen = titleend - titlestart;
-  char title[titlelen + 1];
-  strncpy(title, titlestart, titlelen);
-  title[titlelen] = '\0';
-  char filename[titlelen + 6];
-  snprintf(filename, sizeof(filename), "%s.html", title);
+  if (ret == Z_STREAM_END)
+    writetofile(outbuf, outlen, src, dst);
+  else
+    fprintf(stderr, "inflate failed: %d\n", ret);
 
-  FILE *f = fopen(filename, "w");
-  fwrite(outbuf, 1, streamy.total_out, f);
-  fclose(f);
-  fwrite(outbuf, 1, streamy.total_out, stdout);
+  free(outbuf);
+}
+
+void flush_stream(struct tcp_stream *s) {
+  char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
+  struct in_addr sa, da;
+  sa.s_addr = s->src_ip;
+  da.s_addr = s->dst_ip;
+  inet_ntop(AF_INET, &sa, src_ip, sizeof(src_ip));
+  inet_ntop(AF_INET, &da, dst_ip, sizeof(dst_ip));
+  char src[48], dst[48];
+  snprintf(src, sizeof(src), "%s:%d", src_ip, ntohs(s->src_port));
+  snprintf(dst, sizeof(dst), "%s:%d", dst_ip, ntohs(s->dst_port));
+  if (s->is_gzip)
+    decompress(s->buffer, s->bufferlen, src, dst);
+  else
+    writetofile(s->buffer, s->bufferlen, src, dst);
+  free(s->buffer);
+  s->buffer = NULL;
+  s->bufferlen = 0;
+  s->contentlen = 0;
+  s->active = 0;
 }
 
 void callback(u_char *args, const struct pcap_pkthdr *header,
               const u_char *packet) {
-  printf("packet length: %d\n", header->len);
+  fprintf(stderr, "packet length: %d\n", header->len);
   ethernet = (struct sniff_ethernet *)(packet);
   ip = (struct sniff_ip *)(packet + SIZE_ETHERNET);
   size_ip = IP_HL(ip) * 4;
   if (size_ip < 20) {
-    printf("   * Invalid IP header length: %u bytes\n", size_ip);
+    fprintf(stderr, "   * Invalid IP header length: %u bytes\n", size_ip);
     return;
   }
   tcp = (struct sniff_tcp *)(packet + SIZE_ETHERNET + size_ip);
   size_tcp = TH_OFF(tcp) * 4;
   if (size_tcp < 20) {
-    printf("   * Invalid TCP header length: %u bytes\n", size_tcp);
+    fprintf(stderr, "   * Invalid TCP header length: %u bytes\n", size_tcp);
     return;
   }
   payload = (char *)(packet + SIZE_ETHERNET + size_ip + size_tcp);
   int payload_len = header->len - (SIZE_ETHERNET + size_ip + size_tcp);
+  if (payload_len <= 0)
+    return;
 
   const char *body = NULL;
   int body_len = 0;
-
-  const char *header_end = strstr(payload, "\r\n\r\n");
-  if (header_end && strstr(payload, "Content-Encoding: gzip")) {
-    body = header_end + 4;
-    body_len = payload_len - (body - payload);
+  int is_gzip = 0;
+  int is_new_stream = 0;
+  const char *header_end = NULL;
+  if (payload_len > 5 && memcmp(payload, "HTTP/", 5) == 0)
+    header_end = strstr(payload, "\r\n\r\n");
+  if (header_end) {
+    if (strstr(payload, "Content-Encoding: gzip")) {
+      is_gzip = 1;
+      is_new_stream = 1;
+    } else if (strstr(payload, "Content-Type: text/html")) {
+      is_gzip = 0;
+      is_new_stream = 1;
+    }
+    if (is_new_stream) {
+      body = header_end + 4;
+      body_len = payload_len - (body - payload);
+    }
+  } else {
+    for (int i = 0; i < connections; i++) {
+      if (ip->ip_src.s_addr == tcpconnections[i].src_ip &&
+          ip->ip_dst.s_addr == tcpconnections[i].dst_ip &&
+          tcp->th_sport == tcpconnections[i].src_port &&
+          tcp->th_dport == tcpconnections[i].dst_port) {
+        if (!tcpconnections[i].active)
+          break;
+        int newlen = tcpconnections[i].bufferlen + payload_len;
+        tcpconnections[i].buffer = realloc(tcpconnections[i].buffer, newlen);
+        memcpy(tcpconnections[i].buffer + tcpconnections[i].bufferlen, payload,
+               payload_len);
+        tcpconnections[i].bufferlen = newlen;
+        fprintf(stderr, "continuation: bufferlen=%d contentlen=%d\n",
+                tcpconnections[i].bufferlen, tcpconnections[i].contentlen);
+        if (tcpconnections[i].bufferlen >= tcpconnections[i].contentlen)
+          flush_stream(&tcpconnections[i]);
+        break;
+      }
+    }
+    return;
   }
 
   if (!body || body_len <= 0)
     return;
+
   int found = 0;
   for (int i = 0; i < connections; i++) {
     if (ip->ip_src.s_addr == tcpconnections[i].src_ip &&
@@ -164,35 +248,50 @@ void callback(u_char *args, const struct pcap_pkthdr *header,
         tcp->th_sport == tcpconnections[i].src_port &&
         tcp->th_dport == tcpconnections[i].dst_port) {
       found = 1;
-      tcpconnections[i].bufferlen += body_len;
-      tcpconnections[i].buffer =
-          realloc(tcpconnections[i].buffer, tcpconnections[i].bufferlen);
-      memcpy(tcpconnections[i].buffer + tcpconnections[i].bufferlen - body_len,
-             body, body_len);
-      if (tcpconnections[i].bufferlen >= tcpconnections[i].contentlen) {
-        decompress(tcpconnections[i].buffer, tcpconnections[i].bufferlen);
-      }
+      free(tcpconnections[i].buffer);
+      tcpconnections[i].buffer = malloc(body_len);
+      memcpy(tcpconnections[i].buffer, body, body_len);
+      tcpconnections[i].bufferlen = body_len;
+      tcpconnections[i].is_gzip = is_gzip;
+      tcpconnections[i].active = 1;
+      const char *cls = strstr(payload, "Content-Length: ");
+      if (cls)
+        tcpconnections[i].contentlen = atoi(cls + 16);
+      else
+        tcpconnections[i].contentlen = body_len;
+      fprintf(stderr,
+              "new response on existing stream: bufferlen=%d contentlen=%d\n",
+              tcpconnections[i].bufferlen, tcpconnections[i].contentlen);
+      if (tcpconnections[i].bufferlen >= tcpconnections[i].contentlen)
+        flush_stream(&tcpconnections[i]);
       break;
     }
   }
 
   if (!found) {
-    // create new connection
+    if (connections >= MAXTCPCONNECTIONS) {
+      fprintf(stderr, "too many connections, dropping\n");
+      return;
+    }
     tcpconnections[connections].src_ip = ip->ip_src.s_addr;
     tcpconnections[connections].dst_ip = ip->ip_dst.s_addr;
     tcpconnections[connections].src_port = tcp->th_sport;
     tcpconnections[connections].dst_port = tcp->th_dport;
     tcpconnections[connections].bufferlen = body_len;
+    tcpconnections[connections].is_gzip = is_gzip;
+    tcpconnections[connections].active = 1;
     tcpconnections[connections].buffer = malloc(body_len);
     memcpy(tcpconnections[connections].buffer, body, body_len);
-    const char *contentlenstart = strstr(payload, "Content-Length: ");
-    contentlenstart += 16;
-    tcpconnections[connections].contentlen = atoi(contentlenstart);
-    if (tcpconnections[connections].bufferlen >=
-        tcpconnections[connections].contentlen) {
-      decompress(tcpconnections[connections].buffer,
-                 tcpconnections[connections].bufferlen);
-    }
+    const char *cls = strstr(payload, "Content-Length: ");
+    if (cls)
+      tcpconnections[connections].contentlen = atoi(cls + 16);
+    else
+      tcpconnections[connections].contentlen = body_len;
+    fprintf(stderr, "new stream: bufferlen=%d contentlen=%d\n",
+            tcpconnections[connections].bufferlen,
+            tcpconnections[connections].contentlen);
+    if (tcpconnections[connections].bufferlen >= tcpconnections[connections].contentlen)
+      flush_stream(&tcpconnections[connections]);
     connections++;
   }
 }
@@ -208,25 +307,25 @@ int main(int argc, char *argv[]) {
   const u_char *packet;
   pcap_if_t *alldevs;
 
-  printf("looking for devices\n");
+  fprintf(stderr, "looking for devices\n");
   if (pcap_findalldevs(&alldevs, errbuf) != 0) {
     fprintf(stderr, "findalldevs hot verkockt error: %s\n", errbuf);
     return (2);
   };
   dev = alldevs->name;
 
-  printf("found device %s\n", alldevs->name);
+  fprintf(stderr, "found device %s\n", alldevs->name);
   if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
     fprintf(stderr, "Couldn't get netmask for device %s: %s\n", dev, errbuf);
     net = 0;
     mask = 0;
   }
-  printf("printing network ip: \n");
+  fprintf(stderr, "printing network ip: \n");
   uint8_t *bytes = (uint8_t *)&net;
-  printf("%d.%d.%d.%d\n", bytes[0], bytes[1], bytes[2], bytes[3]);
+  fprintf(stderr, "%d.%d.%d.%d\n", bytes[0], bytes[1], bytes[2], bytes[3]);
 
   handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
-  printf("link type: %d\n", pcap_datalink(handle));
+  fprintf(stderr, "link type: %d\n", pcap_datalink(handle));
   if (handle == NULL) {
     fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
     return (2);
