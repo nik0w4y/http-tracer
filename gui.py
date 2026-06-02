@@ -102,6 +102,16 @@ class App(Gtk.Window):
         bar.set_margin_top(6)
         bar.set_margin_bottom(6)
 
+        bar.pack_start(Gtk.Label(label='Interface:'), False, False, 0)
+
+        self.iface_combo = Gtk.ComboBoxText()
+        ifaces = sorted(i for i in os.listdir('/sys/class/net/') if i != 'lo')
+        for iface in ifaces:
+            self.iface_combo.append_text(iface)
+        if ifaces:
+            self.iface_combo.set_active(0)
+        bar.pack_start(self.iface_combo, False, False, 0)
+
         bar.pack_start(Gtk.Label(label='Targets:'), False, False, 0)
 
         self.target_entry = Gtk.Entry()
@@ -185,9 +195,15 @@ class App(Gtk.Window):
 
     def _start_bettercap(self, *_):
         targets = self.target_entry.get_text().strip()
+        iface = self.iface_combo.get_active_text() or ''
         if not targets:
             self._error('Enter a target IP or subnet first.')
             return
+        if not iface:
+            self._error('Select a network interface first.')
+            return
+        subprocess.run(as_root(['sysctl', '-w', 'net.ipv4.ip_forward=1']),
+                       capture_output=True)
         eval_str = (
             f'net.probe on; '
             f'set arp.spoof.targets {targets}; '
@@ -196,7 +212,7 @@ class App(Gtk.Window):
         )
         try:
             self.bettercap_proc = subprocess.Popen(
-                as_root(['bettercap', '-eval', eval_str]),
+                as_root(['bettercap', '-iface', iface, '-eval', eval_str]),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -206,15 +222,21 @@ class App(Gtk.Window):
             return
         self.btn_bc_start.set_sensitive(False)
         self.btn_bc_stop.set_sensitive(True)
+        self.iface_combo.set_sensitive(False)
         self.target_entry.set_sensitive(False)
-        self.bc_lbl.set_text(f'● Bettercap: running  ({targets})')
+        self.bc_lbl.set_text(f'● Bettercap: running  ({iface} → {targets})')
 
     def _stop_bettercap(self, *_):
         if self.bettercap_proc:
             self.bettercap_proc.terminate()
+            try:
+                self.bettercap_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.bettercap_proc.kill()
             self.bettercap_proc = None
         self.btn_bc_start.set_sensitive(True)
         self.btn_bc_stop.set_sensitive(False)
+        self.iface_combo.set_sensitive(True)
         self.target_entry.set_sensitive(True)
         self.bc_lbl.set_text('● Bettercap: stopped')
 
